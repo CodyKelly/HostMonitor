@@ -1,0 +1,154 @@
+#!/usr/bin/python3.5
+import psutil
+from time import time, strftime
+from pickle import dumps as pickle_dumps
+from sys import getsizeof
+from sys import exit as sysexit
+from argparse import ArgumentParser
+from socket import socket, AF_INET, SOCK_STREAM
+from threading import Thread
+from signal import signal, SIGINT, SIGTERM
+
+def get_time_str():
+    return strftime("'(%x)(%X)'")
+
+class Monitor():
+    ''' This monitor class handles network communication and update intervals'''
+    def __init__(self, name, runInterval, data_method):
+        self.runInterval = runInterval  # The interval (in seconds) of which to send data to the server
+        self.lastRunTime = time()       # The last time data was sent to the server
+        self.get_data = data_method     # The method this monitor should call to gather data from
+                                        # This method should return a namedtuple
+        self.client = None
+        self.name = name
+    
+    def update(self):
+        if self.should_run():
+            self.client.send_str(self.name)
+            self.send_data()
+            self.lastRunTime = time()
+            
+    def send_data(self):
+        # This method takes sends data to the server and information about
+        # the data for storage in a database.
+        if self.get_data:
+            # Pickle the data
+            pickledData = pickle_dumps(self.get_data())
+
+            # And send the data
+            self.client.socket.sendall(pickledData)
+    
+    def should_run(self):
+        if time() - self.lastRunTime > self.runInterval:
+            return True
+        return False
+        
+class Client(Thread):
+    # This is the main client class
+    # This class handles data collection, server communication, and signal handling.
+    
+    def __init__(self, args):
+        Thread.__init__(self)
+        
+        self.timed = False
+        if args.hours != -1:
+            self.timed = True
+            self.endTime = time() + args.hours * 3600 # convert hours into seconds
+                                                     # and add it to the current time
+
+        # Create socket to server and try to connect
+        self.socket = socket(AF_INET, SOCK_STREAM)
+        self.eos = "-END_OF_CLIENT_STR" # End of string marker
+        self.requestExit = False
+        
+        # Store all our monitors in a list for easy updating
+        self.monitors = [Monitor("Disk_IO",     4,  psutil.disk_io_counters),
+                         Monitor("Memory",      3,  psutil.virtual_memory),
+                         Monitor("CPU",         2,  psutil.cpu_times_percent),
+                         Monitor("Heartbeat",   1,  None)]
+        
+        for m in self.monitors:
+            m.client = self
+        
+        # Get name
+        if(args.name):
+            self.name = args.name
+        else:
+            self.name = "{0}:{1}".format(args.ip, args.port)
+        
+        # Try to connect to server
+        try:
+            self.socket.connect((args.ip, args.port))
+        except Exception as e:
+            print("Could not connect {3} to {0}:{1}.\nError: {2}".format(args.ip, args.port, e, self.name))
+            sysexit(1)
+        
+        # Send the client name to the server
+        self.send_str(self.name)
+        
+        # Check if name checks out on the server end
+        serverMsg = self.recv_str()
+        if serverMsg != "Good to go!":
+            print('Server connection denied with message: "{0}"'.format(serverMsg))
+            sysexit(1)
+
+        # Now we'll send info to the server to initialize database tables
+        for m in self.monitors:
+            self.send_str(m.name)
+            m.send_data()
+            
+        # Tell server that we're done sending monitor info
+        self.send_str("END_OF_MONITORS")
+
+    def run(self):  
+        while not self.requestExit:
+            if self.timed and time() < self.endTime:
+                self.stop()
+            else:
+                for m in self.monitors:
+                    m.update()
+                
+    def recv_str(self):
+        strBuffer = "" # String buffer
+        
+        # Check to see if the end of the string buffer contains the end of string marker
+        while strBuffer[-len(self.eos):] != self.eos:
+            # Add another letter to the buffer
+            strBuffer += self.socket.recv(1).decode()
+        
+        return strBuffer[:-len(self.eos)] # Return everything before the end of string marker
+        
+    def send_str(self, string):
+        # This adds the end of string marker to the end of a string and sends it to the server
+        self.socket.sendall((string + self.eos).encode())                                                                                                                                                                                                                                                                                                                                                                                                 
+    
+    def stop(self):
+        self.requestExit = True
+        self.send_str("CLIENTCLOSE")
+    
+    def interrupt(self, signum, frame):
+        self.stop()
+    
+if __name__ == '__main__':
+    
+    # First we'll make an ArgumentParser object
+    # This makes running the client from the terminal cleaner and easier to understand
+    parser = ArgumentParser(description='client.py starts the HM client')
+    parser.add_argument("ip", help="The ip address of the server")
+    parser.add_argument("port", help="The port to connect to", type = int)
+    parser.add_argument("--name", help="The client's name. Useful for running multiple clients on one machine.")
+    parser.add_argument("--hours", help="Number of hours to run the client, can be a decimal. By default, the client will run until it receives a keyboard interrupt.", type = float, default=-1)
+
+    # Store arguments in a variable
+    args = parser.parse_args()
+    
+    # Create client
+    client = Client(args)
+    
+    # Initialize signal handling
+    signal(SIGINT, client.interrupt)
+    signal(SIGTERM, client.interrupt)
+    
+    # Start client
+    client.start()
+    

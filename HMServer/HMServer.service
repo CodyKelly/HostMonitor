@@ -1,0 +1,10 @@
+[Unit]
+Description=Host Monitor Server
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/bin/HMServer/
+ExecStart=/usr/bin/python3.5 /usr/bin/HMServer/server
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,269 @@
+#!/usr/bin/python3.5
+'''
+This is a host monitoring system server. It collects data from a number of clients and stores the data in a database.
+Written by Cody Kelly
+'''
+
+from threading import Thread
+from time import time
+from socket import socket, gaierror, AF_INET, SOCK_STREAM
+from socket import timeout as socketTimeout
+from signal import signal, SIGINT, SIGTERM
+from configparser import ConfigParser
+import sqlite3
+import logging
+from sys import exit as sysexit
+from pickle import loads as pickle_loads
+from os import path as osPath
+
+class ClientHandler(Thread):
+    ''' ClientHandler recieves data from a single client
+        and stores that data appropriately. If the handler doesn't recieve
+        a heartbeat from a client within the timeout time specified in the
+        config file, it will call its exit function. This class also
+        exits cleanly upon server close.'''
+    
+    def __init__(self, socket, config):
+        Thread.__init__(self)
+        # Load settings
+        timeout             = float(config['ServerSettings']['timeout'])
+        
+        self.eos = "-END_OF_CLIENT_STR" # End of string marker
+        self.socket = socket
+        self.running = True
+        self.name = self.recv_str()
+        self.lastHeartbeat = time()
+        self.timeout = timeout
+        self.startTime = time()
+        
+    def run(self):
+        self.db = sqlite3.connect(self.name + ".sqlite3")
+        self.cursor = self.db.cursor()
+        
+        # Give client the go-ahead
+        self.send_str("Good to go!")
+        
+        # And we prepare the database to start receiving data from this client.
+        
+        self.initialize_db_tables()
+        logging.debug("Prepared tables")
+        # And now we'll start receiving the actual data
+        while self.running:
+            clientMsg = self.recv_str()
+            logging.info(clientMsg)
+            if clientMsg == "CLIENTCLOSE":
+                self.stop()
+            elif clientMsg == "Heartbeat":
+                self.lastHeartbeat = time()
+            else:
+                data = self.recv_data()
+                self.store_data(clientMsg, data)
+                    
+            # If client has stopped sending heartbeats, stop the thread
+            timeSinceLastHeartbeat = time() - self.lastHeartbeat
+            if timeSinceLastHeartbeat > self.timeout:
+                logging.warning('Client "{0}" has not sent heartbeat in {1} seconds. Closing connection..'.format(self.name, timeSinceLastHeartbeat))
+                self.stop()
+         
+        logging.info('Client "{0}" disconnected'.format(self.name))
+                
+    def initialize_db_tables(self):
+        # This method receives sample data from each monitor the client has and creates a table for each one.
+        
+        strBuffer = self.recv_str() # This buffer will hold incoming monitor names, and, once the client's
+                                    # done sending info, it will hold the string "END_OF_MONITORS", signaling
+                                    # that we should stop creating tables.
+        
+        while strBuffer != "END_OF_MONITORS":
+            if not strBuffer == "Heartbeat":
+                tableStr = ""           # This will hold the column names
+                data = self.recv_data() # This holds a sample of data from the client
+                                        # We'll use this as a template to create the columns from
+
+                for x in range(len(data)):
+                    tableName = data._fields[x]
+                    tableType = self.get_sql_datatype(data[x])
+                    tableStr += ", {0} {1}".format(tableName, tableType)
+
+                self.cursor.execute("CREATE TABLE IF NOT EXISTS {0}(\
+                Id INTEGER PRIMARY KEY AUTOINCREMENT{1})".format(strBuffer, tableStr))
+            
+            # And lastly we update the strBuffer for the next loop around
+            strBuffer = self.recv_str()
+    
+    def store_data(self, monitorName, data):
+        columnStr = "("  # This holds the column names that we insert data into
+        dataStr = "("    # Holds the values we put into the columns
+        
+        # First we convert our values into strings and add them to the dataStr
+        for x in range(len(data)):
+            if not x == 0:
+                dataStr += ", "
+                columnStr += ", "
+            dataStr     += str(data[x])
+            columnStr   += data._fields[x]
+            if x == len(data) - 1:
+                dataStr += ")"
+                columnStr += ")"
+
+        # Then we add the data to the correct table
+        self.cursor.execute("INSERT INTO {0} {1} VALUES {2}".format(monitorName, columnStr, dataStr))
+        self.db.commit()
+        
+    def get_sql_datatype(self, data):
+        if type(data) == str:
+            return "VARCHAR({0})".format(len(data))
+        elif type(data) == int:
+            return "INTEGER"
+        elif type(data) == float:
+            return "FLOAT"
+        else:
+            return None
+    
+    def recv_data(self):
+        # Receives a str and a pickled named tuple, unpickles it, and returns the result.
+        dataBytes = b''
+        data = None
+        while True:
+            try:
+                dataBytes += self.socket.recv(1)
+                data = pickle_loads(dataBytes)
+                break
+            except:
+                pass
+        return data
+    
+    def recv_str(self):
+        strBuffer = "" # String buffer
+        
+        # Check to see if the end of the string buffer contains the end of string marker
+        while strBuffer[-len(self.eos):] != self.eos:
+            # Add another letter to the buffer
+            letter = self.socket.recv(1).decode()
+            strBuffer += letter
+        return strBuffer[:-len(self.eos)] # Return everything before the end of string marker
+        
+    def send_str(self, string):
+        # This adds the end of string marker to the end of a string and sends it to the server
+        self.socket.sendall((string + self.eos).encode())   
+        
+    def stop(self):
+        self.running = False
+
+class ClientManager(Thread):
+    ''' ClientManager checks for new client connections, creates new
+        ClientHandler objects to handle those, and closes client handlers
+        upon server close'''
+    
+    def __init__(self, config):
+        Thread.__init__(self)
+        logging.debug("Starting server initialization...")
+        
+        '''First we'll load the server settings from config'''
+        
+        # Load network settings
+        serverSettings      = config['ServerSettings']
+        ip                  = serverSettings['ip']
+        port                = int(serverSettings['port'])
+        #dbFilePath          = serverSettings['dbFilePath']
+        
+        '''Now we'll start defining some important server variables'''
+        self.running = True
+        self.config = config
+            
+        # Create server socket for incoming client connections
+        self.socket = socket(AF_INET, SOCK_STREAM)
+        self.socket.settimeout(5)
+        
+        try:
+            self.socket.bind((ip, port))
+        except gaierror as e:
+            logging.error("Could not bind server socket with address: %s. EXITING.." % ip)
+            sysexit()
+        
+        # This will hold all active ClientHandlers
+        self.clients = []
+        
+        logging.info("Server started.")
+    
+    def run(self):
+        while self.running:
+            # Accept incoming connections
+            self.socket.listen(5)
+            clientSock = None
+            
+            try:
+                clientSock, clientAddr = self.socket.accept()
+
+                # Add new client handler if new connection is made
+                if(clientSock):
+                    newClient = ClientHandler(clientSock, self.config)
+
+                    # We need to process the client's name, in case there's a duplicate or invalid name
+                    if not self.has_invalid_name(newClient):
+                        # If the name checks out, it's time to start collecting data from it
+                        newClient.start()
+                        self.clients.append(newClient)
+                        logging.info("Client connected from {0}.".format(clientAddr))
+                    else:
+                        logging.info("Client tried to connect from {0}, but had an invalid name.".format(clientAddr))
+                        newClient.send_str("Invalid client name. Please change and try again.")
+            except OSError:
+                pass
+            
+            for client in self.clients:
+                if not client.running:
+                    self.clients.remove(client)
+    def has_invalid_name(self, client):
+        # First we'll prevent the client from using the name "server"
+        if client.name == "server":
+            return True
+        
+        # Then we'll see if the client's name matches any others connected to the server
+        for client2 in self.clients:
+            if client.name == client2.name and client != client2:
+                return True
+            
+        return False
+    
+    def stop(self, signum, frame):
+        ''' Makes sure the server closes all nicely '''
+        logging.debug("Stopping server...")
+        
+        # Setting running to False will stop the main loop
+        self.running = False
+        
+        # While we wait for the main loop to stop, we'll all our client handlers to stop as well
+        for client in self.clients:
+            client.stop()
+            client.join()
+        
+        # Close the receiving socket and we're done.
+        self.socket.close()
+        
+        self.join()
+        logging.info("Server stopped.")
+
+def main():
+    # Load log settings
+    config = ConfigParser()
+    config.read('config.ini')
+    logSettings         = config['LogSettings']
+    logName             = logSettings['logName']
+    logLevel            = int(logSettings['logLevel'])
+    
+    # Set logging config
+    logging.basicConfig(format="[%(asctime)s] %(levelname)s [%(name)s.%(funcName)s:%(lineno)d] %(message)s",
+                        datefmt="%m/%d/%Y %H:%M:%S", 
+                        filename=logName, 
+                        level=logLevel)
+    
+    clientManager = ClientManager(config)
+    # When the program receives a signal to close, call the server's stop function
+    signal(SIGINT, clientManager.stop)
+    signal(SIGTERM, clientManager.stop)
+    
+    clientManager.start()
+
+if __name__ == '__main__':
+    main()
