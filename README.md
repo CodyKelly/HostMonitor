@@ -2,7 +2,7 @@
 
 This is a host monitoring system, written with Python 3.5, designed for Ubuntu 16.04
 
-_Please note, if you'd actually like to see it working, ignore the server installation instructions and run the server python file directly with python3.5_
+_Please note, if you'd actually like to see it working, ignore the server installation instructions and run the server python file directly with python3.5. This is because it can't actually run as a service right now._
 
 ##_Installation_
 
